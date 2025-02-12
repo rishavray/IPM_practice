@@ -3,6 +3,9 @@
 First load some libraries
 
     library(tidyverse)
+
+    ## Warning: package 'ggplot2' was built under R version 4.2.3
+
     library(ggthemes)
     library(ggdoctheme)
     library(lme4)
@@ -411,3 +414,55 @@ Now let’s visualize the P matrix
     coord_equal()
 
 ![](IPM_WL2_files/figure-markdown_strict/unnamed-chunk-16-1.png)
+
+Calculate the lambda values
+
+    eigen_analysis = eigen(global_kernel$P)
+    lambda = Re(eigen_analysis$values[1])
+    print(lambda)
+
+    ## [1] 0.9909153
+
+    # Stable stage distribution
+    w = Re(eigen_analysis$vectors[,1])
+    # normalize stable stage distribution
+    w = w/sum(w)
+    plot(w)
+
+![](IPM_WL2_files/figure-markdown_strict/unnamed-chunk-17-1.png)
+
+The lambda value is 0.99, indicating that the populations as a whole is
+very close to stable.
+
+Now let’s move on to some other interesting analyses with the mixed
+models.
+
+    ranef_growth = data.frame(ranef(growth_fit)$population) |>
+        rownames_to_column("population") |>
+        rename(intercept = "X.Intercept.", slope = "size")
+      
+    # Calculate global fixed effects
+    fixed_effects = fixef(growth_fit)
+      
+      # Basic random effects plot with quadrant labels
+    ggplot(ranef_growth) +
+    geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+    geom_point(aes(x = slope, y = intercept), size = 3) +
+    geom_text(aes(x = slope, y = intercept, label = population),
+                vjust = -0.5) +
+    annotate("text", x = max(ranef_growth$slope), y = max(ranef_growth$intercept),
+                label = "Fast starters,\nFaster growth", hjust = 1, vjust = 1) +
+    annotate("text", x = min(ranef_growth$slope), y = max(ranef_growth$intercept),
+                label = "Fast starters,\nSlower growth", hjust = 0, vjust = 1) +
+    annotate("text", x = max(ranef_growth$slope), y = min(ranef_growth$intercept),
+                label = "Slow starters,\nFaster growth", hjust = 1, vjust = 0) +
+    annotate("text", x = min(ranef_growth$slope), y = min(ranef_growth$intercept),
+                label = "Slow starters,\nSlower growth", hjust = 0, vjust = 0) +
+    labs(x = "Growth Rate Deviation",
+            y = "Initial Size Deviation",
+            title = "Population-specific Growth Patterns",
+            subtitle = "Deviations from global average growth pattern") +
+    theme_doc()
+
+![](IPM_WL2_files/figure-markdown_strict/unnamed-chunk-18-1.png)
