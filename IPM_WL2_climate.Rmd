@@ -1,0 +1,339 @@
+---
+title: "IPM WL2 garden with climate"
+author: Rishav Ray
+output: 
+ - md_document
+ - html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+# Data load and wrangling the temperature and moisture data to the main data
+
+First load some libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(ggthemes)
+library(ggdoctheme)
+library(lme4)
+library(lmerTest)
+library(ggpubr)
+library(ggrepel)
+library(patchwork)
+library(lubridate)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+select = dplyr::select
+```
+
+Now load the data
+
+```{r}
+data = read_tsv("data/survival_data.tsv")
+temp_data = read_csv("data/WL2_2022_2023_iButton_Data_Corrected.csv") |>
+mutate(datetime_obj = mdy_hm(Date_Time)) |>
+mutate(date = as_date(datetime_obj), time = format(datetime_obj, "%H:%M")) |>
+filter(date > as.Date("2023-07-06")) |>
+select(Bed, date, time, SoilTemp,)
+
+moisture_data = read_csv("data/WL2_2023_Bed_C_Soil_Moisture_Corrected.csv") |>
+mutate(datetime_obj = mdy_hm(Date_Time)) |>
+mutate(date = as_date(datetime_obj), time = format(datetime_obj, "%H:%M")) |>
+filter(date > as.Date("2023-07-06")) |>
+select(date, time, Port_1:Port_5)
+
+```
+
+Take the mean of the 5 ports from the moisture sensor data and summarize to daily with max and min
+
+```{r}
+mean_moisture = moisture_data |>
+rowwise() |>
+mutate(moisture_avg = mean(Port_1:Port_5, na.rm = TRUE)) |>
+select(date, time, moisture_avg)
+
+
+daily_moisture = mean_moisture |>
+ungroup() |>
+group_by(date) |>
+summarize(moisture_max = max(moisture_avg, na.rm = TRUE), moisture_min = min(moisture_avg, na.rm = TRUE), 
+mean_moisture = mean(moisture_avg, na.rm = TRUE), moisture_cv = sd(moisture_avg, na.rm = TRUE)/mean(moisture_avg, na.rm = TRUE)*100)
+```
+
+Make some plots to see the CV over time
+
+```{r}
+daily_moisture |>
+ggplot(aes(x = date, y = moisture_cv, group = 1)) +
+geom_line() +
+geom_point() +
+theme_doc()+
+labs(x = "Date", y = "CV of moisture (%)")
+```
+
+Perform the same with soil temperature data
+
+```{r}
+daily_temp = temp_data |>
+group_by(Bed, date) |>
+summarize(temp_max = max(SoilTemp, na.rm = TRUE), temp_min = min(SoilTemp, na.rm = TRUE),
+mean_temp = mean(SoilTemp, na.rm = TRUE), temp_cv = sd(SoilTemp, na.rm = TRUE)/mean(SoilTemp, na.rm = TRUE)*100)
+```
+
+Visualize the CV by bed
+
+```{r}
+daily_temp |>
+ggplot(aes(x = date, y = temp_cv, group = Bed, color = Bed)) +
+geom_line() +
+geom_point() +
+theme_doc()+
+labs(x = "Date", y = "CV of temperature (%)")
+```
+
+Join the temperature and moisture data together to make things easier. Also, I am going to take the mean of all the beds
+
+```{r}
+daily_temp_moisture = left_join(daily_temp |> 
+ungroup() |> 
+group_by(date) |> 
+summarize(mean_temp = mean(mean_temp, na.rm = TRUE),
+mean_cv = mean(temp_cv, na.rm = TRUE),
+temp_max = max(temp_max, na.rm = TRUE), temp_min = min(temp_min)),
+daily_moisture, by = "date")
+```
+
+Now let's join the two data, by aggregating the daily data to weekly by anchoring it each day
+Already ran, so just load it.
+```
+size_data_with_intervals = data |>
+    arrange(Genotype, survey_date) |>
+    group_by(Genotype) |>
+    mutate(
+      prev_survey_date = lag(survey_date),
+      # If it's the first measurement for a Genotype, use 7 days as default lookback
+      lookback_start = if_else(is.na(prev_survey_date), 
+                               survey_date - days(7), 
+                               prev_survey_date + days(1)),
+      lookback_end = survey_date
+    ) |>
+    ungroup()
+  
+# Join the data with intervals
+
+combined_data = size_data_with_intervals |>
+    rowwise() |>
+    mutate(
+      # Filter environmental data for the specific interval
+      matching_env_data = list(
+        daily_temp_moisture |>
+          filter(date >= lookback_start, date <= lookback_end)
+      ),
+      # Count how many env observations we have for this period
+      env_obs_count = nrow(matching_env_data),
+      # Calculate aggregates
+      period_temp_mean = mean(matching_env_data$mean_temp, na.rm = TRUE),
+      period_temp_cv = mean(matching_env_data$mean_cv, na.rm = TRUE),
+      period_temp_max = max(matching_env_data$temp_max, na.rm = TRUE),
+      period_temp_min = min(matching_env_data$temp_min, na.rm = TRUE),
+      period_moisture_max = max(matching_env_data$moisture_max, na.rm = TRUE),
+      period_moisture_min = min(matching_env_data$moisture_min, na.rm = TRUE),
+      period_moisture_mean = mean(matching_env_data$mean_moisture, na.rm = TRUE),
+      period_moisture_cv = mean(matching_env_data$moisture_cv, na.rm = TRUE)
+    ) |>
+    # Clean up intermediate columns
+    select(-matching_env_data) |>
+    ungroup()
+
+```
+
+```{r}
+#write_tsv(combined_data, "data/combined_data.tsv")
+combined_data = read_tsv("data/combined_data.tsv")
+```
+
+Now visualize the mean temperature vs size by population
+
+```{r}
+ggplot(combined_data, aes(x = period_temp_mean, y = size)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE) +
+  facet_wrap(~ population) +
+  theme_doc() +
+  labs(title = "Effect of Mean Temperature on Plant Size",
+       x = "Mean Temperature (°C)", y = "Plant Size")
+```
+
+Heatmap of growth rate vs environmental variables
+
+```{r}
+# First calculate growth rate
+grate = combined_data |>
+  group_by(Genotype) |>
+  mutate(growth_rate = (sizeNext - size)/7) |>
+  ungroup()
+  
+# Then plot heatmap
+ggplot(grate, aes(x = period_temp_mean, y = period_moisture_max, color = growth_rate)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c() +
+  theme_doc()+
+  labs(title = "Growth Rate by Temperature and Moisture",
+       x = "Mean Temperature (°C)", y = "Maximum Moisture")
+```
+
+```{r}
+# Create long format for environmental variables
+env_long = combined_data |>
+  pivot_longer(
+    cols = c(period_temp_mean, period_temp_cv, period_moisture_mean, period_moisture_cv),
+    names_to = "env_variable",
+    values_to = "env_value"
+  )
+  
+ggplot(env_long, aes(x = env_value, y = sizeNext)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  facet_wrap(~ env_variable, scales = "free_x") +
+  theme_doc()+
+  labs(title = "Size Response to Different Environmental Variables")
+```
+
+```{r}
+ggplot(combined_data, aes(x = size, y = sizeNext, color = period_temp_mean)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_viridis_c(option = "plasma") +
+  theme_doc()+
+  labs(title = "Growth Transitions Colored by Temperature",
+       x = "Current Size", y = "Next Size", colour = "Mean Temperature (°C)")
+```
+
+```{r}
+ggplot(combined_data, aes(x = size, y = sizeNext, color = period_moisture_mean)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_viridis_c(option = "plasma") +
+  theme_doc()+
+  labs(title = "Growth Transitions Colored by Moisture %",
+       x = "Current Size", y = "Next Size", colour = "Mean Moisture (%)")
+```
+
+library(lme4)
+
+```{r}
+# Fit a simple mixed model
+model = lmer(sizeNext ~ period_temp_cv + period_moisture_cv + (1|population), data = combined_data)
+summary(model)
+# Extract and plot predictions
+plotdata = combined_data |>
+select(sizeNext, period_temp_mean, period_moisture_max, population) |>
+na.omit() |>
+mutate(predicted = predict(model))
+
+ggplot(plotdata, aes(x = predicted, y = sizeNext, color = population)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm") +
+  theme_doc()+
+  labs(title = "Mixed Effects Model Predictions vs Observed Size",
+       x = "Predicted Size", y = "Observed Size")
+```
+
+```{r}
+# Check the survival model
+model = glmer(survival ~ size + period_temp_cv + period_moisture_mean + (size | population), family = binomial(), data = combined_data)
+summary(model)
+# Extract and plot predictions
+plotdata = combined_data |>
+select(survival, size, period_temp_cv, period_moisture_mean, population) |>
+na.omit() |>
+mutate(pred_survival = plogis(predict(model)))
+
+plotdata |>
+ggplot(aes(x = factor(survival), y = pred_survival)) +
+geom_boxplot(outlier.shape = NA)+
+geom_jitter(width = 0.1, height = 0.1, alpha = 0.5) +
+labs(x = "Observed Survival", y = "Predicted Survival",
+     title = "Observed vs Predicted Survival") +
+theme_doc()
+```
+
+# Let's make an environment dependent kernel
+
+```{r}
+fit_hierarchical_growth = function(data) {
+  # Fit hierarchical growth model using lme4
+  growth_model = lmer(sizeNext ~ size + poly(size,2) + period_temp_cv + period_moisture_cv + (size | population) + (1|survey_date),
+    data = data
+)
+  
+  return(growth_model)
+}
+
+# Function to fit hierarchical survival model
+fit_hierarchical_survival = function(data) {
+  # Fit hierarchical survival model
+  survival_model = glmer(
+    survival ~ size + poly(size,3) + period_temp_cv + period_moisture_mean + (size | population),
+    family = binomial(),
+    data = data
+  )
+  
+  return(survival_model)
+}
+```
+
+Check model with and without climate data
+```{r}
+growth_model1 = lmer(sizeNext ~ size + period_temp_cv + period_moisture_cv + (size | population) + (1|survey_date),
+    data = combined_data)
+growth_model2 = lmer(sizeNext ~ size + period_moisture_cv + (size | population) + (1|survey_date),
+    data = combined_data)
+summary(growth_model1)
+summary(growth_model2)
+anova(growth_model1, growth_model2)
+
+```
+# Make kernel
+```
+# Define the integration range and mesh points
+min_size <- min(result$size, na.rm = TRUE)
+max_size <- max(result$size, na.rm = TRUE)
+n_mesh <- 100
+mesh_points <- seq(min_size, max_size, length.out = n_mesh)
+
+# Environment-dependent kernel function
+make_kernel <- function(env_temp, env_moisture) {
+  
+  # Get fitted vital rate models
+  growth <- growth_model(mesh_points, env_temp, env_moisture)
+  survival <- survival_model(mesh_points, env_temp, env_moisture)
+  
+  # Initialize kernel matrix
+  K <- matrix(0, n_mesh, n_mesh)
+  
+  # Build the kernel
+  for (i in 1:n_mesh) {
+    for (j in 1:n_mesh) {
+      z <- mesh_points[j]  # Current size
+      zp <- mesh_points[i] # Next size
+      
+      # Growth kernel component
+      mean_size_next <- growth$mean_function(z, env_temp, env_moisture)
+      variance <- growth$variance_function(z)
+      g_z_zp <- dnorm(zp, mean = mean_size_next, sd = sqrt(variance))
+      
+      # Survival component
+      s_z <- survival$function(z, env_temp, env_moisture)
+      
+      # Combine into the kernel
+      K[i, j] <- s_z * g_z_zp
+    }
+  }
+  
+  # Normalize the kernel to ensure proper integration
+  h <- (max_size - min_size) / (n_mesh - 1)  # Step size
+  K <- K * h
+  
+  return(K)
+}
+
+```

@@ -464,3 +464,9 @@ labs(x = "Growth Rate Deviation",
         subtitle = "Deviations from global average growth pattern") +
 theme_doc()
 ```
+
+## Add the soil temperature and moisture data to the main data.
+
+```{r}
+
+```
