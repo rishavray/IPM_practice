@@ -1,0 +1,554 @@
+---
+title: "Population Simulation with AlphaSimR: For *Streptanthus tortuosus* IPM Model"
+author: "Rishav Ray"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This simulation models a plant population with multiple life history traits using AlphaSimR. The model includes size-dependent reproductive traits and exponential decay in QTL effect sizes to simulate realistic genetic architecture.
+
+## Load Required Libraries
+
+```{r libraries}
+library(AlphaSimR)
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(ggdoctheme)
+library(dplyr)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(rstatix)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+# Simulation Parameters
+
+```{r parameters}
+# Population parameters
+n_individuals = 1000
+n_loci = 100
+n_traits = 6
+
+# Trait names
+trait_names = c("Germination", "Initial_Size", "Establishment", 
+ "Growth_Rate", "Flowering_Prob", "Fruit_Per_Plant")
+
+# Heritabilities for each trait
+h2 <- c(0.6, 0.5, 0.7, 0.4, 0.3, 0.4)
+names(h2) <- trait_names
+
+print("Simulation Parameters:")
+print(paste("Number of individuals:", n_individuals))
+print(paste("Number of loci per trait:", n_loci))
+print(paste("Number of traits:", n_traits))
+print("Heritabilities:")
+print(h2)
+```
+
+# Genetic Architecture Setup
+
+```{r genetic_architecture}
+# Create founder genomes
+founderPop = runMacs(nInd = 20,  # Small founder population
+                      nChr = 10,   # 10 chromosomes
+                      segSites = n_loci * n_traits / 10,  # Distribute loci across chromosomes
+                      species = "GENERIC")
+
+# Set up simulation parameters
+SP = SimParam$new(founderPop)
+
+# Function to generate exponentially decaying effect sizes
+generate_effects = function(n_loci, decay_rate = 0.1) {
+  # Generate effects with exponential decay
+  ranks = 1:n_loci
+  effects = exp(-decay_rate * (ranks - 1))
+  
+  # Normalize so largest effect = 1
+  effects = effects / max(effects)
+  
+  # Add some random sign variation
+  signs = sample(c(-1, 1), n_loci, replace = TRUE, prob = c(0.4, 0.6))
+  effects = effects * signs
+  
+  return(effects)
+}
+
+# Generate QTL effects for each trait
+qtl_effects = list()
+for(i in 1:n_traits) {
+  qtl_effects[[i]] = generate_effects(n_loci, decay_rate = 0.08)
+}
+
+# Add traits to simulation parameters
+for(i in 1:n_traits) {
+  SP$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
+               mean = 0,
+               var = 1,
+               corA = NULL,
+               gamma = FALSE,
+               shape = 1,
+               force = TRUE,
+               name = trait_names[i])
+}
+
+# Set heritabilities
+SP$setVarE(h2 = h2)
+
+print("Genetic architecture established with exponential decay in effect sizes")
+```
+
+# Generate F2 Population
+
+```{r generate_f2}
+# Create initial parents from founders
+parents = newPop(founderPop, simParam = SP)
+
+# Create F1 by random mating
+F1 = randCross(parents, nCrosses = 500, simParam = SP)
+
+# Create F2 population
+F2 = randCross(F1, nCrosses = n_individuals, simParam = SP)
+
+print(paste("Generated F2 population with", F2@nInd, "individuals"))
+```
+
+# Extract and Transform Trait Values
+
+```{r extract_traits}
+
+# Extract genetic values (breeding values) for all populations
+gv_parents = parents@gv
+gv_F1 = F1@gv
+gv_F2 = F2@gv
+
+# Extract phenotypes using @pheno slot
+pheno_parents = parents@pheno
+pheno_F1 = F1@pheno
+pheno_F2 = F2@pheno
+# Extract genetic values for all traits
+#gv_matrix = F2@gv
+#colnames(gv_matrix) = trait_names
+
+# Set column names
+colnames(gv_parents) = trait_names
+colnames(gv_F1) = trait_names
+colnames(gv_F2) = trait_names
+colnames(pheno_parents) = trait_names
+colnames(pheno_F1) = trait_names
+colnames(pheno_F2) = trait_names
+
+print("Genetic values and phenotypes extracted")
+print("Dimensions check:")
+print(paste("F2 genetic values:", dim(gv_F2)))
+print(paste("F2 phenotypes:", dim(pheno_F2)))
+
+# Convert to data frame
+trait_data = as.data.frame(gv_F2)
+
+# Transform traits to biologically meaningful scales
+trait_data$Germination = plogis(trait_data$Germination * 0.5)  # Probability (0-1)
+trait_data$Initial_Size = exp(trait_data$Initial_Size * 0.3 + 2)  # Size in mm
+trait_data$Establishment = plogis(trait_data$Establishment * 0.4)  # Probability (0-1)
+trait_data$Growth_Rate = exp(trait_data$Growth_Rate * 0.2 + 1)  # Growth multiplier
+trait_data$Flowering_Prob_base = plogis(trait_data$Flowering_Prob * 0.3)  # Base probability
+trait_data$Fruit_Per_Plant_base = exp(trait_data$Fruit_Per_Plant * 0.4 + 2)  # Base fruit number
+
+# Add individual IDs
+trait_data$Individual = 1:nrow(trait_data)
+
+print("Trait transformation completed")
+head(trait_data)
+```
+
+# Compare Genetic Values vs Phenotypes in F2
+
+```{r compare_gv_pheno}
+# Create comparison data frame for F2
+comparison_data = data.frame(
+  Individual = rep(1:nrow(gv_F2), n_traits),
+  Trait = rep(trait_names, each = nrow(gv_F2)),
+  Genetic_Value = as.vector(gv_F2),
+  Phenotype = as.vector(pheno_F2)
+)
+
+# Calculate correlations between genetic values and phenotypes for each trait
+correlations = sapply(1:n_traits, function(i) {
+  cor(gv_F2[,i], pheno_F2[,i])
+})
+names(correlations) = trait_names
+
+# Create summary table
+correlation_summary = data.frame(
+  Trait = trait_names,
+  Heritability = h2,
+  GV_Pheno_Correlation = correlations,
+  Expected_Correlation = sqrt(h2)  # Theoretical expectation
+)
+
+kable(correlation_summary, digits = 3, 
+      caption = "Genetic Value vs Phenotype Correlations")
+
+print("Correlations between genetic values and phenotypes:")
+print(round(correlations, 3))
+```
+
+# Visualization: Genetic Values vs Phenotypes
+
+```{r gv_pheno_plots, fig.width=15, fig.height=10}
+# Create scatter plots for each trait
+plot_list = list()
+
+for(i in 1:n_traits) {
+  trait_data_all = data.frame(
+    GV = gv_F2[,i],
+    Phenotype = pheno_F2[,i]
+  )
+  
+  p = ggplot(trait_data_all, aes(x = GV, y = Phenotype)) +
+    geom_point(alpha = 0.6, color = "blue") +
+    geom_smooth(method = "lm", color = "red", se = TRUE) +
+    labs(title = paste(trait_names[i]),
+         subtitle = paste("r =", round(correlations[i], 3), 
+                         "| h² =", h2[i]),
+         x = "Genetic Value (Breeding Value)",
+         y = "Phenotype") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 12, hjust = 0.5))
+  
+  plot_list[[i]] = p
+}
+
+# Arrange plots
+do.call(grid.arrange, c(plot_list, ncol = 3))
+```
+
+# Phenotype Distributions Across Generations
+
+```{r phenotype_distributions}
+# Prepare data for plotting distributions across generations
+
+# Fix the trait assignment
+dist_data <- data.frame(
+  Generation = c(rep("Parents", nrow(pheno_parents) * n_traits),
+                 rep("F1", nrow(pheno_F1) * n_traits),
+                 rep("F2", nrow(pheno_F2) * n_traits)),
+  Trait = c(rep(trait_names, nrow(pheno_parents)),
+            rep(trait_names, nrow(pheno_F1)),
+            rep(trait_names, nrow(pheno_F2))),
+  Phenotype = c(as.vector(t(pheno_parents)),
+                as.vector(t(pheno_F1)),
+                as.vector(t(pheno_F2)))
+)
+
+# Set generation as factor with proper order
+dist_data$Generation <- factor(dist_data$Generation, 
+                              levels = c("Parents", "F1", "F2"))
+
+print("Distribution data prepared")
+print("Summary of phenotype distributions:")
+summary_stats <- dist_data %>%
+  group_by(Generation, Trait) %>%
+  summarise(
+    Mean = mean(Phenotype),
+    SD = sd(Phenotype),
+    Min = min(Phenotype),
+    Max = max(Phenotype),
+    .groups = "drop"
+  )
+
+kable(summary_stats, digits = 3, caption = "Phenotype Summary Statistics by Generation")
+```
+
+
+# Density Plots for Better Comparison
+
+```{r density_plots, fig.width=15, fig.height=10}
+# Create density plots for better comparison across generations
+density_plots = list()
+
+for(i in 1:n_traits) {
+  trait_subset = dist_data[dist_data$Trait == trait_names[i], ]
+  
+  p = ggplot(trait_subset, aes(x = Phenotype, color = Generation, fill = Generation)) +
+    geom_density(alpha = 0.3, size = 1) +
+    scale_color_manual(values = c("Parents" = "red", "F1" = "green", "F2" = "blue")) +
+    scale_fill_manual(values = c("Parents" = "red", "F1" = "green", "F2" = "blue")) +
+    labs(title = paste("Phenotype Density:", trait_names[i]),
+         x = "Phenotype Value",
+         y = "Density") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  density_plots[[i]] = p
+}
+
+# Arrange density plots
+do.call(grid.arrange, c(density_plots, ncol = 3))
+```
+
+# Variance Components Analysis
+
+```{r variance_analysis}
+# Calculate variance components for each trait in each generation
+variance_analysis <- data.frame(
+  Trait = rep(trait_names, 3),
+  Generation = rep(c("Parents", "F1", "F2"), each = n_traits),
+  Phenotypic_Variance = c(apply(pheno_parents, 2, var),
+                         apply(pheno_F1, 2, var),
+                         apply(pheno_F2, 2, var)),
+  Genetic_Variance = c(apply(gv_parents, 2, var),
+                      apply(gv_F1, 2, var),
+                      apply(gv_F2, 2, var))
+)
+
+# Calculate environmental variance
+variance_analysis$Environmental_Variance <- variance_analysis$Phenotypic_Variance - 
+                                          variance_analysis$Genetic_Variance
+
+# Calculate realized heritability
+variance_analysis$Realized_Heritability <- variance_analysis$Genetic_Variance / 
+                                          variance_analysis$Phenotypic_Variance
+
+kable(variance_analysis, digits = 3, 
+      caption = "Variance Components Analysis by Generation")
+
+# Plot variance components
+variance_long = variance_analysis %>%
+  select(Trait, Generation, Genetic_Variance, Environmental_Variance) %>%
+  pivot_longer(cols = c("Genetic_Variance", "Environmental_Variance"),
+  names_to = "Variance_Component", 
+       values_to = "Variance")
+
+ggplot(variance_long, aes(x = Generation, y = Variance, fill = Variance_Component)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~Trait, scales = "free_y") +
+  scale_fill_manual(values = c("Genetic_Variance" = "lightblue", 
+                               "Environmental_Variance" = "lightcoral")) +
+  labs(title = "Variance Components Across Generations",
+       x = "Generation",
+       y = "Variance",
+       fill = "Variance Component") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Heritability Validation
+
+```{r heritability_validation}
+# Compare expected vs realized heritabilities
+heritability_comparison <- data.frame(
+  Trait = trait_names,
+  Expected_h2 = h2,
+  Realized_h2_Parents = variance_analysis$Realized_Heritability[1:n_traits],
+  Realized_h2_F1 = variance_analysis$Realized_Heritability[(n_traits+1):(2*n_traits)],
+  Realized_h2_F2 = variance_analysis$Realized_Heritability[(2*n_traits+1):(3*n_traits)]
+)
+
+kable(heritability_comparison, digits = 3, 
+      caption = "Expected vs Realized Heritabilities")
+
+# Plot heritability comparison
+herit_long <- heritability_comparison |>
+  pivot_longer(cols = -Trait, names_to = "Heritability_Type", values_to = "Heritability")
+
+ggplot(herit_long, aes(x = Trait, y = Heritability, fill = Heritability_Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Expected_h2" = "gold",
+                               "Realized_h2_Parents" = "red",
+                               "Realized_h2_F1" = "green", 
+                               "Realized_h2_F2" = "blue")) +
+  labs(title = "Expected vs Realized Heritabilities",
+       x = "Trait",
+       y = "Heritability",
+       fill = "Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Size-Dependent Reproductive Traits
+
+```{r size_dependent_traits}
+# Calculate final size based on initial size and growth rate
+trait_data$Final_Size = trait_data$Initial_Size * trait_data$Growth_Rate
+
+# Size-dependent flowering probability
+# Larger plants have higher flowering probability
+size_effect_flowering = (trait_data$Final_Size - min(trait_data$Final_Size)) / 
+                        (max(trait_data$Final_Size) - min(trait_data$Final_Size))
+
+trait_data$Flowering_Prob = trait_data$Flowering_Prob_base * (0.5 + 0.5 * size_effect_flowering)
+trait_data$Flowering_Prob = pmin(trait_data$Flowering_Prob, 0.95)  # Cap at 95%
+
+# Size-dependent fruit production
+# Only flowering plants produce fruit, and larger plants produce more
+trait_data$Flowers = rbinom(nrow(trait_data), 1, trait_data$Flowering_Prob)
+
+size_effect_fruit = (trait_data$Final_Size - min(trait_data$Final_Size)) / 
+                    (max(trait_data$Final_Size) - min(trait_data$Final_Size))
+
+trait_data$Fruit_Per_Plant = trait_data$Flowers * 
+                             (trait_data$Fruit_Per_Plant_base * (0.3 + 0.7 * size_effect_fruit))
+
+print("Size-dependent traits calculated")
+print(paste("Proportion flowering:", round(mean(trait_data$Flowers), 3)))
+print(paste("Mean fruits per flowering plant:", 
+            round(mean(trait_data$Fruit_Per_Plant[trait_data$Flowers == 1]), 2)))
+```
+
+# Visualization
+
+```{r visualizations, fig.width=12, fig.height=10}
+# Create summary statistics
+summary_stats = trait_data |>
+get_summary_stats(type = "common")
+
+
+# Print summary
+kable(t(summary_stats), digits = 3, caption = "Trait Summary Statistics")
+
+# Plot 1: Distribution of key traits
+p1 = ggplot(trait_data, aes(x = Germination)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "skyblue") +
+  labs(title = "Germination Rate Distribution", x = "Germination Probability", y = "Count") +
+  theme_doc()
+
+p2 = ggplot(trait_data, aes(x = Final_Size)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "lightgreen") +
+  labs(title = "Final Size Distribution", x = "Final Size (mm)", y = "Count") +
+  theme_doc()
+
+p3 = ggplot(trait_data, aes(x = Flowering_Prob)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "orange") +
+  labs(title = "Flowering Probability Distribution", x = "Flowering Probability", y = "Count") +
+  theme_doc()
+
+p4 = ggplot(trait_data, aes(x = Fruit_Per_Plant)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "pink") +
+  labs(title = "Fruit Production Distribution", x = "Fruits per Plant", y = "Count") +
+  theme_doc()
+
+(p1 + p2)/( p3 + p4)
+```
+
+```{r size_relationships, fig.width=12, fig.height=8}
+# Plot 2: Size-dependent relationships
+p5 = ggplot(trait_data, aes(x = Final_Size, y = Flowering_Prob)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "loess", color = "red") +
+  labs(title = "Size vs Flowering Probability", 
+       x = "Final Size (mm)", y = "Flowering Probability") +
+  theme_doc()
+
+p6 = ggplot(trait_data[trait_data$Flowers == 1, ], 
+             aes(x = Final_Size, y = Fruit_Per_Plant)) +
+  geom_point(alpha = 0.6, color = "darkgreen") +
+  geom_smooth(method = "loess", color = "red") +
+  labs(title = "Size vs Fruit Production (Flowering Plants Only)", 
+       x = "Final Size (mm)", y = "Fruits per Plant") +
+  theme_doc()
+
+p5 + p6
+```
+
+```{r trait_correlations, fig.width=10, fig.height=8}
+# Plot 3: Trait correlations
+cor_traits = trait_data |>
+  select(Germination, Initial_Size, Establishment, Growth_Rate, 
+         Final_Size, Flowering_Prob, Fruit_Per_Plant) |>
+  cor()
+
+# Create correlation heatmap
+cor_df = as.data.frame(as.table(cor_traits))
+names(cor_df) = c("Trait1", "Trait2", "Correlation")
+
+ggplot(cor_df, aes(Trait1, Trait2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1)) +
+  theme_doc() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Trait Correlation Matrix")
+```
+
+# Fitness and Selection Analysis
+
+```{r fitness_analysis}
+# Calculate composite fitness measure
+# Fitness = Germination × Establishment × (Fruit_Per_Plant + 1)
+trait_data$Fitness = trait_data$Germination * 
+                      trait_data$Establishment * 
+                      (trait_data$Fruit_Per_Plant + 1)
+
+# Standardize fitness
+trait_data$Fitness_Std = scale(trait_data$Fitness)[,1]
+
+# Selection analysis
+selection_summary = trait_data |>
+  summarise(
+    Mean_Fitness = mean(Fitness),
+    Var_Fitness = var(Fitness),
+    CV_Fitness = sd(Fitness)/mean(Fitness),
+    Prop_Reproductive = mean(Flowers),
+    Mean_Reproductive_Success = mean(Fruit_Per_Plant[Flowers == 1])
+  )
+
+kable(selection_summary, digits = 3, caption = "Population Fitness Summary")
+
+# Plot fitness distribution
+ggplot(trait_data, aes(x = Fitness)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "purple") +
+  geom_vline(xintercept = mean(trait_data$Fitness), color = "red", linetype = "dashed") +
+  labs(title = "Fitness Distribution", 
+       subtitle = paste("Mean fitness =", round(mean(trait_data$Fitness), 3)),
+       x = "Composite Fitness", y = "Count") +
+  theme_doc()
+```
+
+# Save Results
+
+```{r save_results}
+# Save the population data
+#write.csv(trait_data, "data/F2_population_traits.csv", row.names = FALSE)
+
+# Save genetic values matrix
+#write.csv(gv_matrix, "data/F2_genetic_values.csv", row.names = FALSE)
+
+print("Results saved to CSV files:")
+print("- F2_population_traits.csv: All trait values and derived measures")
+print("- F2_genetic_values.csv: Raw genetic values from AlphaSimR")
+```
+
+# Summary
+
+In this simulation we successfully generated an F2 population of 1000 individuals with the following characteristics:
+
+1. **Genetic Architecture**: Each trait controlled by 100 QTL with exponentially decaying effect sizes, creating realistic genetic architecture where few loci have large effects.
+
+2. **Life History Traits**: 
+   - Germination probability (0-1)
+   - Initial and final size (cm)
+   - Establishment probability (0-1)
+   - Growth rate multiplier
+   - Size-dependent flowering probability
+   - Size-dependent fruit production
+
+3. **Key assumptions**: 
+   - Larger plants have higher flowering probability and fruit production
+   - Only flowering plants produce fruit
+   - Composite fitness incorporates multiple life stages
