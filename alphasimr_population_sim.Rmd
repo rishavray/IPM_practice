@@ -47,6 +47,8 @@ n_traits = 6
 trait_names = c("Germination", "Initial_Size", "Establishment", 
  "Growth_Rate", "Flowering_Prob", "Fruit_Per_Plant")
 
+trait_means = c(0.5, 2, 0.6, 1.2, 0.3, 2)  # Mean values for traits
+
 # Heritabilities for each trait
 h2 <- c(0.6, 0.5, 0.7, 0.4, 0.3, 0.4)
 names(h2) <- trait_names
@@ -71,39 +73,15 @@ founderPop = runMacs(nInd = 20,  # Small founder population
 # Set up simulation parameters
 SP = SimParam$new(founderPop)
 
-# Function to generate exponentially decaying effect sizes
-generate_effects = function(n_loci, decay_rate = 0.1) {
-  # Generate effects with exponential decay
-  ranks = 1:n_loci
-  effects = exp(-decay_rate * (ranks - 1))
-  
-  # Normalize so largest effect = 1
-  effects = effects / max(effects)
-  
-  # Add some random sign variation
-  signs = sample(c(-1, 1), n_loci, replace = TRUE, prob = c(0.4, 0.6))
-  effects = effects * signs
-  
-  return(effects)
-}
-
-# Generate QTL effects for each trait
-qtl_effects = list()
-for(i in 1:n_traits) {
-  qtl_effects[[i]] = generate_effects(n_loci, decay_rate = 0.08)
-}
 
 # Add traits to simulation parameters
-for(i in 1:n_traits) {
-  SP$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
-               mean = 0,
-               var = 1,
-               corA = NULL,
-               gamma = FALSE,
+
+SP$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
+               mean = trait_means,
+               var = c(1,1,1,1,1,1),
+               gamma = TRUE,
                shape = 1,
-               force = TRUE,
-               name = trait_names[i])
-}
+               name = trait_names)
 
 # Set heritabilities
 SP$setVarE(h2 = h2)
