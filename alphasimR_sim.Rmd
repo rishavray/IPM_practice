@@ -1,0 +1,346 @@
+---
+title: "Population Simulation with AlphaSimR: For *Streptanthus tortuosus* IPM Model"
+author: "Rishav Ray"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+In this vignette, I would mostly be focusing on simulating few populations of *Strepthanthus tortuosus* and some phenotype values to feed them into the downstream IPM models.
+
+## Load Required Libraries
+
+```{r libraries}
+library(AlphaSimR)
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(ggdoctheme)
+library(dplyr)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(rstatix)
+library(modelr)
+library(broom)
+library(rsample)
+library(yardstick)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+## Simulation Parameters
+
+```{r parameters}
+# Population parameters
+n_individuals = 1000
+n_loci = 100
+n_traits = 6
+
+# Trait names
+trait_names = c("Germination", "Initial_Size", "Establishment", 
+ "Growth_Rate", "Flowering_Prob", "Fruit_Per_Plant")
+
+trait_means = c(0.5, 2, 0.6, 1.2, 0.3, 2)  # Mean values for traits
+
+# Heritabilities for each trait
+h2 = c(0.6, 0.5, 0.7, 0.4, 0.3, 0.4)
+names(h2) = trait_names
+
+print("Simulation Parameters:")
+print(paste("Number of individuals:", n_individuals))
+print(paste("Number of loci per trait:", n_loci))
+print(paste("Number of traits:", n_traits))
+print("Heritabilities:")
+print(h2)
+```
+
+## Genetic Architecture Setup
+
+```{r genetic_architecture}
+# Create founder genomes
+founderPop = runMacs(nInd = 50,  # Small founder population
+                      nChr = 10,   # 10 chromosomes
+                      segSites = n_loci * n_traits / 10,  # Distribute loci across chromosomes
+                      species = "GENERIC")
+
+# Set up simulation parameters
+SP = SimParam$new(founderPop)
+
+
+# Add traits to simulation parameters
+
+SP$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
+               mean = trait_means,
+               var = c(1,1,1,1,1,1),
+               gamma = TRUE,
+               shape = 1,
+               name = trait_names)
+
+# Set heritabilities
+SP$setVarE(h2 = h2)
+
+print("Genetic architecture established")
+
+parents = newPop(founderPop, simParam = SP)
+```
+
+Now we extract and visualize the traits and genetic values
+
+## Extract and Transform Trait Values
+
+```{r extract_traits}
+
+# Extract genetic values (breeding values) for all populations
+gv_parents = parents@gv
+meanG(parents)
+meanP(parents)
+
+# Extract phenotypes using @pheno slot
+pheno_parents = parents@pheno
+
+
+# Extract genetic values for all traits
+plot_data = cbind(gv_parents, pheno_parents)
+new_names = c("Germination_GV", "Initial_Size_GV", "Establishment_GV", 
+            "Growth_Rate_GV", "Flowering_Prob_GV", "Fruit_Per_Plant_GV",
+            "Germination_Pheno", "Initial_Size_Pheno", "Establishment_Pheno", 
+            "Growth_Rate_Pheno", "Flowering_Prob_Pheno", "Fruit_Per_Plant_Pheno")
+colnames(plot_data) = new_names
+
+```
+
+
+# Visualize Genetic Values and Phenotypes
+
+```{r viz_traits}
+
+ggplot(plot_data, aes(x = Germination_GV, y = Germination_Pheno)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(title = "Germination: Genetic Value vs Phenotype",
+       x = "Genetic Value", y = "Phenotype") +
+  theme_doc() +
+  theme(plot.title = element_text(hjust = 0.5, size =14))
+```
+
+## Run a CV Analysis of prediction
+
+```{r cv_analysis}
+cv_results = tibble()
+k = 5
+repeats = 10
+
+data = as.data.frame(plot_data) |>
+mutate(Individual = row_number()) |>
+dplyr::select(Individual,
+    Genetic_Value = Germination_GV, 
+             Phenotype = Germination_Pheno)
+
+
+for (rep in 1:repeats) {
+    cat(sprintf("Running CV repeat %d/%d\n", rep, repeats))
+    
+    # Create k-fold splits
+    cv_folds = vfold_cv(data, v = k, strata = NULL)
+    
+    # Perform CV for this repeat
+    fold_results = cv_folds |>
+      mutate(
+        # Fit model on training data
+        model = map(splits, ~ lm(Phenotype ~ Genetic_Value, data = analysis(.x))),
+        
+        # Get model statistics on training data
+        train_stats = map(model, glance),
+        
+        # Make predictions on test data
+        predictions = map2(model, splits, ~ {
+          test_data = assessment(.y)
+          predictions = predict(.x, newdata = test_data)
+          
+          tibble(
+            Individual = test_data$Individual,
+            Actual = test_data$Phenotype,
+            Predicted = predictions,
+            Residual = Actual - Predicted
+          )
+        }),
+        
+        # Calculate fold-level metrics
+        fold_metrics = map(predictions, ~ {
+          tibble(
+            RMSE = sqrt(mean(.x$Residual^2)),
+            MAE = mean(abs(.x$Residual)),
+            R_squared = cor(.x$Actual, .x$Predicted)^2,
+            Correlation = cor(.x$Actual, .x$Predicted),
+            Bias = mean(.x$Residual)
+          )
+        })
+      )
+    
+    # Extract results for this repeat
+    repeat_results = fold_results |>
+      select(id, fold_metrics) |>
+      unnest(fold_metrics) |>
+      mutate(Repeat = rep)
+    
+    cv_results = bind_rows(cv_results, repeat_results)
+}
+
+cv_summary = cv_results |>
+  group_by(Repeat) |>
+  summarise(
+    Mean_RMSE = mean(RMSE),
+    Mean_MAE = mean(MAE),
+    Mean_R_squared = mean(R_squared),
+    Mean_Correlation = mean(Correlation),
+    Mean_Bias = mean(Bias),
+    .groups = "drop"
+  )
+```
+
+# Display CV Summary
+```{r display_cv_summary}
+p1 = cv_summary |>
+  ggplot(aes(x = factor(Repeat), y = Mean_R_squared)) +
+  geom_boxplot(alpha = 0.7, fill = "lightblue") +
+  geom_point() +
+  geom_hline(yintercept = mean(cv_summary$Mean_R_squared), 
+             color = "red", linetype = "dashed") +
+  labs(title = "R² Across CV Repeats",
+       x = "CV Repeat",
+       y = "Mean R²") +
+  theme_doc() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+  plot.title = element_text(hjust = 0.5, size =14))
+
+p2 = cv_summary |>
+  ggplot(aes(x = factor(Repeat), y = Mean_RMSE)) +
+  geom_boxplot(alpha = 0.7, fill = "lightcoral") +
+  geom_point() +
+  geom_hline(yintercept = mean(cv_summary$Mean_RMSE), 
+             color = "red", linetype = "dashed") +
+  labs(title = "RMSE Across CV Repeats",
+       x = "CV Repeat", 
+       y = "Mean RMSE") +
+  theme_doc() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+  plot.title = element_text(hjust = 0.5, size =14))
+
+p3 = cv_summary |>
+  ggplot(aes(x = factor(Repeat), y = Mean_Correlation)) +
+  geom_boxplot(alpha = 0.7, fill = "lightgreen") +
+  geom_point() +
+  geom_hline(yintercept = mean(cv_summary$Mean_Correlation), 
+             color = "red", linetype = "dashed") +
+  labs(title = "Correlation Across CV Repeats",
+       x = "CV Repeat",
+       y = "Mean Correlation") +
+  theme_doc() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+  plot.title = element_text(hjust = 0.5, size =14))
+
+p1
+p2
+p3
+```
+
+The correlation between the genetic values and phenotypes is quite high, indicating that the genetic architecture is well-defined and the traits are heritable. The CV analysis shows that the model performs consistently across different folds, with reasonable R² and RMSE values.
+
+## How about we try and make a cross of two populations with different trait means?
+
+```{r cross_populations}
+trait_means_pop1 = c(0.5, 2, 0.6, 1.2, 0.3, 2)  # Mean values for traits
+trait_means_pop2 = c(0.9, 1.2, 1, 1.8, 0.7, 1.3)  # Mean values for traits
+
+# Heritabilities for each trait
+h2 = c(0.6, 0.5, 0.7, 0.4, 0.3, 0.4)
+names(h2) = trait_names
+
+founderPop = runMacs(nInd = 50,  # Small founder population
+nChr = 10,   # 10 chromosomes
+segSites = n_loci * n_traits / 10,  # Distribute loci across chromosomes
+species = "GENERIC")
+
+# Set up simulation parameters
+SP1 = SimParam$new(founderPop)
+SP2 = SimParam$new(founderPop)
+
+
+# Add traits to simulation parameters
+
+SP1$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
+               mean = trait_means_pop1,
+               var = c(1,1,1,1,1,1),
+               gamma = TRUE,
+               shape = 1,
+               name = trait_names)
+
+SP2$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
+               mean = trait_means_pop2,
+               var = c(1,1,1,1,1,1),
+               gamma = TRUE,
+               shape = 1,
+               name = trait_names)
+
+# Set heritabilities
+SP1$setVarE(h2 = h2)
+SP2$setVarE(h2 = h2)
+
+print("Genetic architecture established")
+
+pop1 = newPop(founderPop, simParam = SP1)
+pop2 = newPop(founderPop, simParam = SP2)
+
+mega_pop = newMultiPop(pop1, pop2)
+
+
+```
+
+```{r cross_pops}
+
+# Now we can cross the two pops
+randCross = randCross2(pop1, pop2, nCrosses = 1000)
+
+# Extract genetic values and phenotypes for the crossed population
+gv_crossed = randCross@gv
+pheno_crossed = randCross@pheno
+# Combine genetic values and phenotypes into a single data frame
+crossed_data = cbind(gv_crossed, pheno_crossed)
+new_names_crossed = c("Germination_GV", "Initial_Size_GV",
+                        "Establishment_GV", "Growth_Rate_GV",
+                        "Flowering_Prob_GV", "Fruit_Per_Plant_GV",
+                        "Germination_Pheno", "Initial_Size_Pheno",
+                        "Establishment_Pheno", "Growth_Rate_Pheno",
+                        "Flowering_Prob_Pheno", "Fruit_Per_Plant_Pheno")
+colnames(crossed_data) = new_names_crossed
+# Visualize the genetic values and phenotypes for the crossed population
+ggplot(crossed_data, aes(x = Germination_GV, y = Germination_Pheno)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  labs(title = "Germination: Genetic Value vs Phenotype (Crossed Population)",
+       x = "Genetic Value", y = "Phenotype") +
+  theme_doc() +
+  theme(plot.title = element_text(hjust = 0.5, size =14))
+
+# Visualize the distribution of genetic values and phenotypes for the crossed population
+ggplot(crossed_data, aes(x = Germination_Pheno)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Germination Genetic Values (Crossed Population)",
+       x = "Genetic Value", y = "Count") +
+  theme_doc() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+meanP(randCross)
+meanG(randCross)
+```
