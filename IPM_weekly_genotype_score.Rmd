@@ -1,0 +1,201 @@
+---
+title: "Population Sim Trial with genotype scores"
+author: "Rishav Ray"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    keep_md: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Population Simulation Attempt
+
+This code is mostly based off of Brandie QC's simulation code, and I am adding how to extract the genotype score and use it in the IPM model.
+
+Suggested parameters from Julin:
+
+-   1000 F2s (or just 1000 individuals)
+
+    -   Done with runMacs
+
+-   100 loci per trait with some kind of (expotnetial?) decay in effect
+    size
+
+    -   Use nQtlPerChr??
+
+-   Traits:
+
+    -   Germination
+
+    -   Initial size
+
+    -   Establishment
+
+    -   Growth rate
+
+    -   Flowering probability
+
+        -   Ideally would depend on size... - do this through
+            correlation matrix?
+
+    -   Fruit per plant
+
+        -   Ideally would depend on size...
+
+    -   others?
+
+Rishav demoed AlphaRSim:
+<https://cran.r-project.org/web/packages/AlphaSimR/index.html>
+
+-   Rishav's demo is on his GitHub:
+    <https://github.com/rishavray/IPM_practice/blob/main/IPM_genetic_simulation.Rmd>
+
+## Libraries
+
+```{r}
+library(AlphaSimR)
+library(tidyverse)
+library(ggthemes)
+logit <- brms::logit_scaled
+inv_logit <- brms::inv_logit_scaled
+```
+
+## Create Founder Population
+
+```{r}
+founderPop = runMacs(
+  nInd = 1000, #number of individuals to simulate 
+  nChr = 10, #number of chromosomes to simulate - may not be important to match to Streps' 14
+  segSites = NULL, #number of segregating sites to keep per chromosome.
+  species = "GENERIC" #The GENERIC history is meant to be a reasonable all-purpose choice. It runs quickly and models a population with an effective populations size that has gone through several historic bottlenecks.
+)
+```
+
+## Define Genetic Architecture for Traits
+
+```{r}
+SP <- SimParam$new(founderPop)
+#Starts the process of building a new simulation by creating a new SimParam object and assigning a founder population to the class.
+
+traitMeans <- c(germination.logit = logit(0.33), #logit to scale it (from gene --> trait)
+                establishment.logit = logit(0.67),
+                y1surv.logit = logit(0.45),
+                alpha = 40, #Hmax = alpha -Sets the asymptote (max growth) for the Weibull model 
+                beta = 7, #Hmin = beta -Changes the y intercept (the lower limit) for the Weibull model- recruit size?
+                k = 0.01, #Often described as the growth rate --\> related to the slope of the line for the Weibull model 
+                delta = 0.5, #Sets the inflection point - when you shift b/t concave to convex for the Weibull model 
+                flowering.logit = logit(0.25),
+                fruitPerPlant = 30)
+
+SP$addTraitA(nQtlPerChr = 10, 
+              mean = traitMeans, 
+              var = (traitMeans*0.25)^2, #genetic CV = 0.25 (?)
+              gamma = TRUE, #a lot of small effect loci and a few large effect loci 
+              shape = 1, #shape parameter for gamma distribution 
+              name=names(traitMeans))
+
+SP$setVarE(h2=rep(0.5, length(traitMeans))) #set heritability to 0.5 
+```
+
+## Create Initial Population
+
+```{r}
+pop = newPop(founderPop, simParam = SP)
+pop1 <- setPheno(pop)
+```
+
+```{r}
+pheno <- pop1@pheno %>% as_tibble()
+dim(pheno)
+head(pheno)
+```
+
+### Convert pheno logits to probabilities and phenotypes
+```{r}
+pheno <- pheno %>%
+  mutate(across(ends_with(".logit"), .fns = inv_logit, 
+         .names = "{.col}.prob")) %>%
+  rename_with(.fn = \(n) str_replace(n, "\\.logit\\.prob", "\\.prob")) %>%
+  mutate(germinated = rbinom(n(), size=1, prob=germination.prob),
+         established = ifelse(germinated, rbinom(n(), size=1, prob=establishment.prob), NA),
+         beta, 
+         alpha, 
+         k = ifelse(established, k, NA), #can only have a growth rate if you establish
+         delta = ifelse(established, delta, NA),
+         y1surv = ifelse(established, rbinom(n(), size =1, prob=y1surv.prob), NA),
+         flowered = ifelse(established, rbinom(n(), size = 1, prob = flowering.prob), NA),
+         fruitPerPlant = ifelse(flowered, fruitPerPlant, NA))
+```
+
+```{r}
+pheno %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales="free") +
+  theme_bw()
+```
+
+## Try to get weekly growth data
+
+### Model growth with the Weibull model
+
+```{r}
+weibull <- function (t, alpha, beta, k, delta) {
+  result <- alpha - (alpha - beta) * exp(-(k * t)^delta)
+  return(result)
+}
+
+##Example:
+growth <- tibble(week = seq(0,12, 1)) %>%
+  mutate(size = weibull(t = week,
+                          alpha = 40, #Hmax = alpha -  Sets the asymptote (max growth)
+                          beta = 0.5, #Hmin = beta - Changes the y intercept (the lower limit)
+                          k = 0.01, #k - Often described as the growth rate --\> related to the slope of the line
+                          delta = 0.5)) #delta - Sets the inflection point - when you shift b/t concave to convex
+
+growth %>%  ggplot(aes(x=week, y=size)) +
+  geom_line() +
+  theme_bw()
+```
+
+### Pheno weekly
+```{r}
+pheno_weekly <- pheno %>% 
+  mutate(Indiv_ID=row_number()) %>% 
+  slice(rep(1:n(), each = 12)) %>% #duplicate each row 12 times 
+  group_by(Indiv_ID) %>% 
+  mutate(week=row_number(), #12 weeks for each indiv
+         week_next=lead(week, order_by = week), 
+         elapsed_days= week_next - week, #interval length in days
+         size = if_else(week==1, beta, #size in week 1 is the min size (beta)
+                        weibull(t = week, #otherwise use the weibull formula to calculate size
+                        alpha = alpha,
+                        beta = beta,
+                        k = k, 
+                        delta = delta)))
+pheno_weekly
+```
+
+## Extract genotype scores
+```{r}
+# Extract genotype scores for each individual
+genotype_scores <- pop1@gv %>%
+    as_tibble() %>%
+    rownames_to_column(var = "Indiv_ID") %>%
+    mutate(Indiv_ID = as.integer(Indiv_ID)) %>%
+    select(Indiv_ID, everything())
+
+# Join genotype scores with phenotypic data
+pheno_weekly_merged <- pheno_weekly %>%
+    left_join(genotype_scores, by = "Indiv_ID", suffix = c("_pheno", "_geno"))
+
+pheno_weekly_merged |>
+select(Indiv_ID, week, size, week_next, germination.logit_geno, germination.logit_pheno)
+```

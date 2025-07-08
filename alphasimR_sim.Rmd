@@ -34,6 +34,7 @@ library(modelr)
 library(broom)
 library(rsample)
 library(yardstick)
+library(rrBLUP)
 
 # Set seed for reproducibility
 set.seed(123)
@@ -89,10 +90,12 @@ SP$addTraitA(nQtlPerChr = n_loci/10,  # Distribute across chromosomes
 
 # Set heritabilities
 SP$setVarE(h2 = h2)
+SP$addSnpChip(5)
 
 print("Genetic architecture established")
 
 parents = newPop(founderPop, simParam = SP)
+
 ```
 
 Now we extract and visualize the traits and genetic values
@@ -117,6 +120,7 @@ new_names = c("Germination_GV", "Initial_Size_GV", "Establishment_GV",
             "Germination_Pheno", "Initial_Size_Pheno", "Establishment_Pheno", 
             "Growth_Rate_Pheno", "Flowering_Prob_Pheno", "Fruit_Per_Plant_Pheno")
 colnames(plot_data) = new_names
+plot_data = as.data.frame(plot_data)
 
 ```
 
@@ -343,4 +347,55 @@ ggplot(crossed_data, aes(x = Germination_Pheno)) +
 
 meanP(randCross)
 meanG(randCross)
+```
+
+```{r trait_geno_analysis}
+mat = pullQtlGeno(parents, trait = 1, simParam = SP)
+
+dim(mat)
+
+ans = mixed.solve(plot_data$Germination_Pheno, Z = mat, method = "REML")
+
+prediction = (mat %*% ans$u ) + ans$beta[1] # add intercept
+
+comparison = data.frame(Actual = plot_data$Germination_Pheno, Predicted = prediction)
+head(comparison)
+# Calculate prediction accuracy
+cor(comparison$Actual, comparison$Predicted)
+# Plot actual vs predicted
+ggplot(comparison, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Actual vs Predicted Size",
+       x = "Actual Size",
+       y = "Predicted Size") +
+  theme_doc()
+```
+
+## Now try a train and test splits
+
+```{r train_test_split}
+sample_idx = sample(1:nrow(mat), 35)
+train_mat = mat[sample_idx, ]
+test_mat = mat[-sample_idx, ]
+train_pheno = plot_data$Germination_Pheno[sample_idx]
+test_pheno = plot_data$Germination_Pheno[-sample_idx]
+
+ans = mixed.solve(train_pheno, Z = train_mat, method = "REML")
+
+prediction = (test_mat %*% ans$u ) + ans$beta[1] # add intercept
+
+comparison = data.frame(Actual = test_pheno, Predicted = prediction)
+head(comparison)
+# Calculate prediction accuracy
+cor(comparison$Actual, comparison$Predicted)
+# Plot actual vs predicted
+ggplot(comparison, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Actual vs Predicted Size",
+       x = "Actual Size",
+       y = "Predicted Size") +
+  theme_doc()
+
 ```
